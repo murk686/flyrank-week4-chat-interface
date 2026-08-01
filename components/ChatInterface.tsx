@@ -21,6 +21,14 @@ import { isTextUIPart, type UIMessage, DefaultChatTransport } from "ai";
 import { useEffect, useRef, useState, useCallback } from "react";
 import StreamingMarkdown from "./StreamingMarkdown";
 import ThinkingIndicator from "./ThinkingIndicator";
+import {
+  ScoreLeadPending,
+  LeadScoreCard,
+  LeadScoreError,
+  InquiryConfirmPrompt,
+  InquiryConfirmSent,
+  InquiryConfirmDeclined,
+} from "./ToolParts";
 import { Send, Square, ArrowDown } from "lucide-react";
 
 const SCROLL_THRESHOLD = 80;
@@ -38,7 +46,7 @@ function formatTime() {
 }
 
 export default function ChatInterface() {
-  const { messages, sendMessage, status, stop } = useChat({
+  const { messages, sendMessage, status, stop, addToolOutput } = useChat({
     transport: new DefaultChatTransport({ api: "/api/chat" }),
   });
 
@@ -107,6 +115,72 @@ export default function ChatInterface() {
     (status === "streaming" && lastMessage?.role === "assistant" && getTextContent(lastMessage).length === 0);
 
   const suggestedPrompts = ["Explain streaming SSE", "Write a React hook", "What is RAG?"];
+
+  /**
+   * FE-07: renders every non-text part of a message — i.e. the tool
+   * calls — as its own card beneath the text bubble. Switches on
+   * part.type first (which tool), then part.state (which of the four
+   * typed states: input-streaming, input-available, output-available,
+   * output-error), so each state gets a visually distinct treatment
+   * instead of a JSON dump.
+   */
+  function renderToolParts(msg: UIMessage) {
+    return msg.parts.map((part, i) => {
+      if (part.type === "tool-scoreLead") {
+        const callId = part.toolCallId;
+        switch (part.state) {
+          case "input-streaming":
+            return <ScoreLeadPending key={callId} label="Scoring lead…" />;
+          case "input-available":
+            return (
+              <ScoreLeadPending
+                key={callId}
+                label={`Evaluating a ${part.input.interest} inquiry from a ${part.input.role}…`}
+              />
+            );
+          case "output-available":
+            return <LeadScoreCard key={callId} result={part.output} />;
+          case "output-error":
+            return <LeadScoreError key={callId} message={part.errorText} />;
+          default:
+            return null;
+        }
+      }
+
+      if (part.type === "tool-sendInquiry") {
+        const callId = part.toolCallId;
+        switch (part.state) {
+          case "input-streaming":
+            return <ScoreLeadPending key={callId} label="Preparing inquiry…" />;
+          case "input-available":
+            return (
+              <InquiryConfirmPrompt
+                key={callId}
+                summary={part.input.summary}
+                onConfirm={() =>
+                  addToolOutput({ tool: "sendInquiry", toolCallId: callId, output: "confirmed" })
+                }
+                onDecline={() =>
+                  addToolOutput({ tool: "sendInquiry", toolCallId: callId, output: "declined" })
+                }
+              />
+            );
+          case "output-available":
+            return part.output === "confirmed" ? (
+              <InquiryConfirmSent key={callId} />
+            ) : (
+              <InquiryConfirmDeclined key={callId} />
+            );
+          case "output-error":
+            return <LeadScoreError key={callId} message={part.errorText ?? "Couldn't send that inquiry."} />;
+          default:
+            return null;
+        }
+      }
+
+      return null;
+    });
+  }
 
   return (
     <div style={{
@@ -311,6 +385,14 @@ export default function ChatInterface() {
                         </span>
                       )}
                     </div>
+
+                    {/* FE-07: tool call cards (scoreLead / sendInquiry) */}
+                    {isAssistant && (
+                      <div style={{ display: "flex", flexDirection: "column", gap: 6, width: "100%" }}>
+                        {renderToolParts(msg)}
+                      </div>
+                    )}
+
                     <div style={{
                       fontSize: 10, color: "rgba(255,255,255,0.2)",
                       padding: "0 4px",
