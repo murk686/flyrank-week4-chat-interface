@@ -29,6 +29,7 @@ import {
   InquiryConfirmSent,
   InquiryConfirmDeclined,
 } from "./ToolParts";
+import type { LeadScoreResult } from "@/lib/tools";
 import { Send, Square, ArrowDown } from "lucide-react";
 
 const SCROLL_THRESHOLD = 80;
@@ -131,15 +132,17 @@ export default function ChatInterface() {
         switch (part.state) {
           case "input-streaming":
             return <ScoreLeadPending key={callId} label="Scoring lead…" />;
-          case "input-available":
+          case "input-available": {
+            const input = part.input as { interest: string; role: string };
             return (
               <ScoreLeadPending
                 key={callId}
-                label={`Evaluating a ${part.input.interest} inquiry from a ${part.input.role}…`}
+                label={`Evaluating a ${input.interest} inquiry from a ${input.role}…`}
               />
             );
+          }
           case "output-available":
-            return <LeadScoreCard key={callId} result={part.output} />;
+            return <LeadScoreCard key={callId} result={part.output as LeadScoreResult} />;
           case "output-error":
             return <LeadScoreError key={callId} message={part.errorText} />;
           default:
@@ -156,7 +159,7 @@ export default function ChatInterface() {
             return (
               <InquiryConfirmPrompt
                 key={callId}
-                summary={part.input.summary}
+                summary={(part.input as { summary: string }).summary}
                 onConfirm={() =>
                   addToolOutput({ tool: "sendInquiry", toolCallId: callId, output: "confirmed" })
                 }
