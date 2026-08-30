@@ -1,107 +1,131 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# FlyRank Chat — Streaming AI Assistant with Tool-Calling
 
-## Getting Started
+A Next.js chat interface that streams AI responses token-by-token and can act as a lightweight lead-qualification agent for site visitors — it scores hiring/collaboration inquiries automatically, and asks for explicit human confirmation before sending anything to Murk.
 
-First, run the development server:
+**Demo video:** https://youtu.be/qFHN2KvmD5o
+**Live demo:** `<add your deployed Vercel URL here once the redeploy is fixed>` — shown running locally in the demo video above in the meantime.
+**Who it's for:** recruiters, clients, or collaborators visiting the portfolio site who want to ask questions and, if relevant, get evaluated as a lead and have their inquiry forwarded — without needing a contact form.
+
+---
+
+## Setup (from scratch, no prior context needed)
+
+**Requirements:** Node.js 18+, and a free [Groq API key](https://console.groq.com) (no credit card required).
+
+```bash
+git clone <repo-url>
+cd flyrank-chat
+npm install
+```
+
+Create a file named `.env` in the project root with:
+
+```
+GROQ_API_KEY=your_key_here
+```
+
+Then run:
 
 ```bash
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open `http://localhost:3000` — the chat interface loads immediately, no further config needed.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+> ⚠️ `.env` holds a real secret. Make sure your `.gitignore` excludes plain `.env` (not just `.env.local`) before you ever push — otherwise the key ends up public on GitHub.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+---
 
-## Learn More
+## Usage
 
-To learn more about Next.js, take a look at the following resources:
+- Type a message and hit **Enter** or **⌘/Ctrl+Enter** to send. Responses stream in token-by-token.
+- Click the **stop button** (square icon) mid-response to abort generation — the partial reply stays in the conversation instead of vanishing.
+- Say something like *"I'm a hiring manager evaluating you for a role, I need someone in the next few weeks"* — the assistant will ask any missing details (role/timeline/interest) and then call the `scoreLead` tool automatically, showing a scored result card (hot/warm/cold + reasons).
+- After being scored, say *"yes, send that to Murk"* — the assistant prepares a one-line summary and shows a **confirm/decline prompt**. Nothing is sent until you explicitly click confirm.
+- To see the error/retry flow without waiting for a real outage, type exactly `TEST_ERROR_500` or `TEST_ERROR_429` — these are built-in test hooks (see Architecture) that trigger a real failure response so the error banner + retry button can be demonstrated reliably.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+---
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## Architecture
 
-## Deploy on Vercel
+```
+app/api/chat/route.ts     Server route. Receives the message history,
+                           calls Groq (llama-3.3-70b-versatile) via the
+                           Vercel AI SDK's streamText(), streams the
+                           response back as SSE. Registers two tools
+                           (below) that the model can call mid-stream.
+                           Also hosts two hardcoded "sabotage hooks" —
+                           magic strings that trigger a real 429 or 500
+                           on purpose, for reliable demo/testing of the
+                           failure path.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+lib/ai-config.ts          Single source of truth for model name, system
+                           prompt, temperature, max tokens.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
-## FE-07: Tool Contract
+lib/tools.ts               scoreLead   — server-side tool, runs automatically.
+                                         Deterministic scoring function
+                                         (not model output) — same input
+                                         always gives the same score.
+                            sendInquiry — client-side tool, NO execute
+                                         function on purpose. This makes
+                                         the AI SDK pause and wait for the
+                                         browser to supply a result, which
+                                         is what forces the human-confirm
+                                         step below.
 
-Two tools are wired into the `/api/chat` route (`lib/tools.ts`).
+components/
+  ChatInterface.tsx        useChat() hook — streaming state, stop/retry,
+                           auto-scroll, renders tool-call cards inline
+                           with the conversation.
+  ChatErrorBanner.tsx      Shown when a request/stream fails. Retry calls
+                           regenerate(), which re-sends only the last
+                           user message, not the whole conversation.
+  ToolParts.tsx            Visual states for the two tools: pending,
+                           scored result, confirm/decline prompt, sent/
+                           declined outcome.
+```
 
-### `scoreLead` — server-side (auto-executed)
+**Data flow for a lead:** visitor message → model decides to call `scoreLead` → server runs deterministic scoring → result card renders in chat → if visitor wants to proceed → model calls `sendInquiry` (no execute) → SDK pauses → confirm/decline UI renders → visitor clicks → `addToolOutput()` resumes the model with the visitor's choice → model responds accordingly. Nothing is ever sent without that click.
 
-| | |
+---
+
+## Eval results (v2)
+
+`scoreLead` is deterministic (plain code, not model output), so it's directly unit-testable. `eval-scorelead.js` runs 10 cases against it — category weighting, exact tier boundaries (40/70 cutoffs), case-insensitive decision-maker detection, the 100-point clamp, and the two designed failure paths (empty/too-short role).
+
+**Result: 10/10 passed (100%)**
+
+```bash
+node eval-scorelead.js   # reproduces the table below
+```
+
+| Case | Result |
 |---|---|
-| **Trigger** | Model calls this when a visitor explains why they're reaching out (hiring / collaboration / general). |
-| **Input schema** | `{ interest: "hiring" \| "collaboration" \| "general", role: string, timeline: "immediate" \| "this_quarter" \| "exploring" }` |
-| **Return shape** | `{ score: number (0-100), tier: "hot" \| "warm" \| "cold", reasons: string[] }` |
-| **Error case** | Throws if `role` is shorter than 2 characters after trimming — rendered client-side as a designed error card, not a crash. |
+| Hiring + immediate + decision-maker title → 100, hot | ✅ |
+| Hiring + immediate + non-decision-maker title → 85, hot | ✅ |
+| Collaboration + this_quarter + Founder → 65, warm | ✅ |
+| General + exploring → 15, cold | ✅ |
+| Exact tier boundary at 70 → hot | ✅ |
+| Exact tier boundary at 40 → warm | ✅ |
+| Case-insensitive title match ("ceo" lowercase) | ✅ |
+| Too-short role (1 char) → throws as designed | ✅ |
+| Whitespace-only role → throws as designed | ✅ |
+| Score clamps at 100, never exceeds | ✅ |
 
-Scoring logic is plain deterministic code (`lib/tools.ts`), not model-generated — the LLM only decides *when* to call the tool and *what* to pass in.
+This eval covers the deterministic tool logic, not the LLM's judgment calls (e.g. *when* it decides to call the tool, or how it phrases follow-up questions) — those are harder to pin to an exact expected output and weren't scored here.
 
-### `sendInquiry` — client-side (requires user confirmation)
+---
 
-| | |
-|---|---|
-| **Trigger** | Model calls this after a lead is scored, if the visitor wants their inquiry sent. |
-| **Input schema** | `{ summary: string }` — one-sentence summary shown to the visitor before they confirm. |
-| **Return shape** | `"confirmed" \| "declined"` — supplied by the client via `addToolOutput`, not the server. |
-| **Why no `execute`** | Omitting `execute` on the server is what makes the AI SDK treat this as a client-side tool: it pauses and waits for `ChatInterface` to render a Yes/No prompt and call `addToolOutput` once the visitor decides. Nothing is sent until that confirmation happens. |
+## Limitations
 
-### Tool part states
+- **The `/api/chat` route has no authentication or rate limiting of its own** — anyone with the URL can send requests and consume the Groq API quota. Groq's free tier has its own rate limits, but nothing in this app stops abuse before that. A production version would need per-IP or per-session rate limiting on the route itself.
+- **No persistent chat history** — conversation state lives only in the browser tab; refreshing the page loses it. There's no database or session store.
+- **Model choice is cost-driven, not capability-driven** — Groq's `llama-3.3-70b-versatile` was chosen because it has a genuinely free tier (Anthropic/Google's free tiers were either paid-only or quota-restricted in testing). This is a real quality trade-off: Llama 3.3 70B is capable but generally reasons less reliably than Claude/GPT-4-class models, especially on ambiguous tool-calling decisions.
+- **Vercel's 30-second function timeout** (`maxDuration = 30`) caps how long a single response can stream — very long generations could get cut off mid-stream.
+- **The `sendInquiry` tool has no actual send implementation wired up yet** — the confirm/decline UI and state machine are fully built, but confirming currently just marks the tool call "confirmed" client-side rather than dispatching a real email/webhook. The guardrail (never send without confirmation) is real; the send action itself is a stub.
 
-Both tools render all four typed states distinctly in `ChatInterface.tsx` (see `renderToolParts`):
+---
 
-- **input-streaming** — pulsing dot + label ("Scoring lead…")
-- **input-available** — same pending treatment, now showing the actual input the model is about to send
-- **output-available** — the real result component (`LeadScoreCard` / `InquiryConfirmSent`)
-- **output-error** — a designed error card (`LeadScoreError`), distinct from a crash or raw JSON
+## Built with AI
 
-## FE-08: Error States, Empty States, Edge Cases
-
-### Failure inventory & how each is handled
-
-| Failure | Handling |
-|---|---|
-| Route-level crash | `app/error.tsx` — designed fallback screen with a "Try again" button (calls Next.js's `reset()`) |
-| Root layout crash | `app/global-error.tsx` — last-resort fallback if the layout itself breaks |
-| Mid-stream / API failure | `useChat`'s `error` object renders a banner (`ChatErrorBanner.tsx`) with a **Retry** button. Retry calls `regenerate()`, which resends only the last user message — not the whole conversation. The button guards against double-clicks with a `retrying` state. |
-| Rate limit (429) | Simulated via the `TEST_ERROR_429` sabotage phrase (see below) — returns a real 429 response, surfaces through the same error banner. |
-| Slow / pending response | `MessageSkeleton.tsx` — three shimmering lines sized close to real response width, instead of a spinner, to minimize layout shift when real content arrives. |
-| Empty input | Send button is disabled whenever `input.trim()` is empty — can't submit nothing. |
-| First-run empty state | Empty state shows 3 clickable example prompts (including one that demonstrates the `scoreLead` tool) instead of a blank screen. |
-
-### Sabotage hooks (reproducible failure testing)
-
-`app/api/chat/route.ts` recognizes two exact message strings and triggers a real failure on purpose, so the error + retry flow can be demonstrated reliably instead of hoping a genuine network blip happens during a recording:
-
-- Sending **`TEST_ERROR_500`** throws inside the route handler → simulates a generic server failure.
-- Sending **`TEST_ERROR_429`** returns a real 429 response → simulates a rate limit.
-
-These are harmless magic strings scoped to this route only — not a security-relevant backdoor.
-
-### Manual sabotage checklist (tested in this order, per the assignment's suggested script)
-
-1. Kill network (DevTools → Network → Offline) before sending → error banner + retry shown
-2. Send `TEST_ERROR_500` → mid-response failure → error banner + retry shown
-3. Send `TEST_ERROR_429` → rate-limit failure → error banner + retry shown
-4. Click Retry — confirms it resends only the failed message, not the full thread
-5. Reload with an empty conversation → confirms first-run empty state with example prompts
-
-### Mobile Safari fixes
-
-- Outer container uses `100dvh` instead of `100vh` (fixes the address-bar-resize jump)
-- Input `textarea` font-size set to `16px` (below 16px, iOS Safari force-zooms the page on focus)
-- Input bar padding includes `env(safe-area-inset-bottom)` (clears the home-indicator area on notched devices)
-- Message scroll container uses `overscroll-behavior: contain` (stops rubber-band scroll from fighting auto-scroll-to-bottom)
-
+This project was built with **Claude** and **Cursor (Composer)** as coding assistants across several weekly iterations (streaming chat, tool-calling, error states). I made the architectural calls — which tools to add, that `sendInquiry` should require explicit confirmation rather than auto-sending, and the Groq-over-Anthropic provider decision — and tested the app manually myself each week. Claude also helped me write this README and build the `eval-scorelead.js` test harness, and caught a real security issue while reviewing the code: `.gitignore` wasn't actually excluding my `.env` file, which I've since fixed.
