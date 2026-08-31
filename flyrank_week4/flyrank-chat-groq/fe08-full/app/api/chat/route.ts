@@ -24,6 +24,17 @@
  * These are harmless magic strings, not a real backdoor — they don't
  * touch auth, data, or anything sensitive. Safe to leave in for the
  * portfolio; remove if it ever bothers a reviewer.
+ *
+ * FE-10 addition: real IP-based rate limiting. This closes a
+ * limitation documented in the README (the route previously had no
+ * abuse protection). Implementation is an in-memory sliding window —
+ * deliberately simple, no new paid service required. Honest tradeoff:
+ * because Vercel serverless functions aren't guaranteed to stay warm
+ * or share memory across instances, this resets occasionally rather
+ * than being perfectly distributed. That's an acceptable fit for a
+ * portfolio chat widget's actual threat model (casual abuse), not a
+ * high-security system. A fully distributed limiter would use
+ * Upstash Redis — noted as a future improvement, not built here.
  * ─────────────────────────────────────────────────────────────
  */
 
@@ -35,11 +46,63 @@ import {
   AI_TEMPERATURE,
   SYSTEM_PROMPT,
 } from "@/lib/ai-config";
-import { scoreLead, scoreLeadInputSchema, sendInquiryInputSchema } from "@/lib/tools";
+import { scoreLead, scoreLeadInputSchema, sendInquiryInputSchema, searchPortfolioInputSchema } from "@/lib/tools";
+import { searchPortfolio } from "@/lib/portfolio-data";
 
 export const maxDuration = 30;
 
+// ── Rate limiting ──
+// Sliding window: max N requests per IP per WINDOW_MS.
+const RATE_LIMIT_MAX = 20;
+const RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+
+// Module-level Map — persists for the lifetime of a warm serverless
+// instance. Not shared across instances/cold starts (see note above).
+const requestLog = new Map<string, number[]>();
+
+function getClientIp(req: Request): string {
+  // Vercel sets x-forwarded-for; first entry is the original client.
+  const fwd = req.headers.get("x-forwarded-for");
+  if (fwd) return fwd.split(",")[0].trim();
+  return "unknown";
+}
+
+function isRateLimited(ip: string): boolean {
+  const now = Date.now();
+  const windowStart = now - RATE_LIMIT_WINDOW_MS;
+  const timestamps = (requestLog.get(ip) ?? []).filter((t) => t > windowStart);
+
+  if (timestamps.length >= RATE_LIMIT_MAX) {
+    requestLog.set(ip, timestamps); // prune even on reject
+    return true;
+  }
+  timestamps.push(now);
+  requestLog.set(ip, timestamps);
+  return false;
+}
+
+// Occasionally prune old IPs entirely so the Map doesn't grow forever
+// across a long-lived warm instance.
+let lastPrune = Date.now();
+function prunePeriodically() {
+  const now = Date.now();
+  if (now - lastPrune < RATE_LIMIT_WINDOW_MS) return;
+  lastPrune = now;
+  const cutoff = now - RATE_LIMIT_WINDOW_MS;
+  for (const [ip, timestamps] of requestLog) {
+    const kept = timestamps.filter((t) => t > cutoff);
+    if (kept.length === 0) requestLog.delete(ip);
+    else requestLog.set(ip, kept);
+  }
+}
+
 const TOOL_SYSTEM_ADDENDUM = `
+
+Whenever a visitor asks a specific factual question about Murk — background,
+tech stack, pricing, certifications, experience, education, contact info,
+etc. — use the searchPortfolio tool first rather than answering from
+general knowledge or guessing. If it returns no match, say so honestly and
+suggest emailing Murk directly rather than inventing an answer.
 
 You also help visitors who are reaching out about hiring or collaboration.
 When a visitor explains why they're contacting Murk, use the scoreLead tool
@@ -62,6 +125,18 @@ function getLastUserText(messages: UIMessage[]): string {
 }
 
 export async function POST(req: Request) {
+  prunePeriodically();
+
+  const ip = getClientIp(req);
+  if (isRateLimited(ip)) {
+    return new Response(
+      JSON.stringify({
+        error: `Too many requests. Limit is ${RATE_LIMIT_MAX} messages per 5 minutes — please wait a bit and try again.`,
+      }),
+      { status: 429, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
   const body = await req.json();
   const messages = body.messages as UIMessage[];
   const lastUserText = getLastUserText(messages);
@@ -102,6 +177,18 @@ export async function POST(req: Request) {
         description:
           "Ask the visitor to confirm before their inquiry is sent to Murk. Requires explicit user confirmation — no execute function on purpose.",
         inputSchema: sendInquiryInputSchema,
+      },
+      searchPortfolio: {
+        description:
+          "Look up a specific, real fact about Murk (background, tech stack, pricing, certifications, experience, etc.) before answering. Use this instead of guessing whenever the visitor asks something factual about Murk rather than making general conversation.",
+        inputSchema: searchPortfolioInputSchema,
+        execute: async ({ query }) => {
+          const results = searchPortfolio(query);
+          if (results.length === 0) {
+            return { found: false, note: "No matching info found — answer generally and suggest they email Murk directly for specifics." };
+          }
+          return { found: true, results };
+        },
       },
     },
   });

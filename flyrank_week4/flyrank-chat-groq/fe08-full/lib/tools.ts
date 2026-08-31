@@ -105,3 +105,19 @@ export const sendInquiryInputSchema = z.object({
 });
 
 export type SendInquiryInput = z.infer<typeof sendInquiryInputSchema>;
+
+/**
+ * searchPortfolio — server-side tool (has `execute`, like scoreLead).
+ * Runs automatically whenever the model needs a specific fact about
+ * Murk (background, stack, pricing, etc.) instead of guessing from
+ * the system prompt alone. See lib/portfolio-data.ts for the
+ * retrieval implementation and design-decision notes.
+ */
+export const searchPortfolioInputSchema = z.object({
+  query: z
+    .string()
+    .min(1)
+    .describe("The visitor's question, used to look up relevant facts about Murk's background/work/pricing."),
+});
+
+export type SearchPortfolioInput = z.infer<typeof searchPortfolioInputSchema>;
