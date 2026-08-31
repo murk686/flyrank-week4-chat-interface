@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
+    "dev": "next dev --webpack",
     "build": "next build",
     "start": "next start"
   },
@@ -14,11 +14,12 @@
     "@ai-sdk/react": "^4.0.40",
     "ai": "^7.0.37",
     "lucide-react": "^1.26.0",
-    "next": "^15.3.3",
+    "next": "^16.3.3",
     "react": "19.2.4",
     "react-dom": "19.2.4",
     "react-markdown": "^10.1.0",
     "remark-gfm": "^4.0.1",
+    "resend": "^6.25.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {

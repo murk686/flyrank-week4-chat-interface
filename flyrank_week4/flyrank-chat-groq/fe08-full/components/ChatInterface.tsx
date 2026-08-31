@@ -29,6 +29,8 @@ import {
   InquiryConfirmPrompt,
   InquiryConfirmSent,
   InquiryConfirmDeclined,
+  InquiryConfirmFailed,
+  PortfolioSearchResult,
 } from "./ToolParts";
 import type { LeadScoreResult } from "@/lib/tools";
 import { Send, Square, ArrowDown } from "lucide-react";
@@ -48,7 +50,7 @@ function formatTime() {
 }
 
 export default function ChatInterface() {
-  const { messages, sendMessage, status, stop, addToolOutput, error, regenerate } = useChat({
+  const { messages, sendMessage, status, stop, addToolOutput, error, regenerate, setMessages } = useChat({
     transport: new DefaultChatTransport({ api: "/api/chat" }),
     // FE-08: log every chat-level error for debugging/sabotage verification.
     // The user-facing handling lives in the `error` object below (banner + retry),
@@ -60,9 +62,57 @@ export default function ChatInterface() {
 
   const [input, setInput] = useState("");
   const [mounted, setMounted] = useState(false);
+  // FE-10: tracks sendInquiry tool calls currently mid-request to the
+  // real email endpoint, so the UI can show "Sending…" instead of
+  // looking frozen while we wait on the network.
+  const [sendingIds, setSendingIds] = useState<Set<string>>(new Set());
   const isLoading = status === "submitted" || status === "streaming";
 
-  useEffect(() => { setMounted(true); }, []);
+  // ── FE-10: persist conversation across page refreshes ──
+  // Chat history is scoped to this browser (localStorage), not a
+  // database — no accounts/auth exist yet, so there's no user to tie
+  // server-side history to. This solves "refresh wipes the chat"
+  // without adding backend infrastructure.
+  const STORAGE_KEY = "flyrank-chat-history-v1";
+  const hydrated = useRef(false);
+
+  useEffect(() => {
+    setMounted(true);
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          setMessages(parsed);
+        }
+      }
+    } catch (e) {
+      console.warn("[chat history] failed to load saved messages", e);
+    } finally {
+      hydrated.current = true;
+    }
+  }, []);
+
+  useEffect(() => {
+    // Skip the very first render before hydration finishes, so we
+    // don't overwrite saved history with an empty array before it's
+    // had a chance to load.
+    if (!hydrated.current) return;
+    try {
+      if (messages.length > 0) {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(messages));
+      } else {
+        localStorage.removeItem(STORAGE_KEY);
+      }
+    } catch (e) {
+      console.warn("[chat history] failed to save messages", e);
+    }
+  }, [messages]);
+
+  const clearHistory = useCallback(() => {
+    setMessages([]);
+    try { localStorage.removeItem(STORAGE_KEY); } catch {}
+  }, [setMessages]);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -167,26 +217,63 @@ export default function ChatInterface() {
           case "input-streaming":
             return <ScoreLeadPending key={callId} label="Preparing inquiry…" />;
           case "input-available":
+            if (sendingIds.has(callId)) {
+              return <ScoreLeadPending key={callId} label="Sending inquiry…" />;
+            }
             return (
               <InquiryConfirmPrompt
                 key={callId}
                 summary={(part.input as { summary: string }).summary}
-                onConfirm={() =>
-                  addToolOutput({ tool: "sendInquiry", toolCallId: callId, output: "confirmed" })
-                }
+                onConfirm={async () => {
+                  const summary = (part.input as { summary: string }).summary;
+                  setSendingIds((prev) => new Set(prev).add(callId));
+                  try {
+                    const res = await fetch("/api/send-inquiry", {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({ summary }),
+                    });
+                    if (!res.ok) throw new Error("send-inquiry request failed");
+                    addToolOutput({ tool: "sendInquiry", toolCallId: callId, output: "confirmed" });
+                  } catch (e) {
+                    console.error("[sendInquiry] real send failed", e);
+                    addToolOutput({ tool: "sendInquiry", toolCallId: callId, output: "failed" });
+                  } finally {
+                    setSendingIds((prev) => {
+                      const next = new Set(prev);
+                      next.delete(callId);
+                      return next;
+                    });
+                  }
+                }}
                 onDecline={() =>
                   addToolOutput({ tool: "sendInquiry", toolCallId: callId, output: "declined" })
                 }
               />
             );
           case "output-available":
-            return part.output === "confirmed" ? (
-              <InquiryConfirmSent key={callId} />
-            ) : (
-              <InquiryConfirmDeclined key={callId} />
-            );
+            if (part.output === "confirmed") return <InquiryConfirmSent key={callId} />;
+            if (part.output === "failed") return <InquiryConfirmFailed key={callId} />;
+            return <InquiryConfirmDeclined key={callId} />;
           case "output-error":
             return <LeadScoreError key={callId} message={part.errorText ?? "Couldn't send that inquiry."} />;
+          default:
+            return null;
+        }
+      }
+
+      if (part.type === "tool-searchPortfolio") {
+        const callId = part.toolCallId;
+        switch (part.state) {
+          case "input-streaming":
+          case "input-available":
+            return <ScoreLeadPending key={callId} label="Searching portfolio…" />;
+          case "output-available": {
+            const output = part.output as { found: boolean; results?: { topic: string; content: string }[] };
+            return <PortfolioSearchResult key={callId} found={output.found} results={output.results} />;
+          }
+          case "output-error":
+            return null; // fail silently — the model still answers, just ungrounded
           default:
             return null;
         }
@@ -234,6 +321,31 @@ export default function ChatInterface() {
             gpt-oss-120b · streaming chat
           </div>
         </div>
+
+        {messages.length > 0 && (
+          <button
+            onClick={clearHistory}
+            title="Clear saved chat history"
+            style={{
+              display: "flex", alignItems: "center", gap: 5,
+              padding: "5px 11px", borderRadius: 20, cursor: "pointer",
+              background: "transparent",
+              border: "1px solid rgba(255,255,255,0.08)",
+              color: "rgba(255,255,255,0.35)", fontSize: 10,
+              transition: "all 0.2s",
+            }}
+            onMouseEnter={e => {
+              (e.currentTarget as HTMLElement).style.borderColor = "rgba(8,145,178,0.4)";
+              (e.currentTarget as HTMLElement).style.color = "rgba(103,232,249,0.8)";
+            }}
+            onMouseLeave={e => {
+              (e.currentTarget as HTMLElement).style.borderColor = "rgba(255,255,255,0.08)";
+              (e.currentTarget as HTMLElement).style.color = "rgba(255,255,255,0.35)";
+            }}
+          >
+            Clear chat
+          </button>
+        )}
 
         <div style={{
           display: "flex", alignItems: "center", gap: 6,
